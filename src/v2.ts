@@ -109,6 +109,7 @@ const CursorV2Plugin = Plugin.define({
     const stopWatching = watchConnections(ctx, async () => {
       clearModelCache();
       catalog = await loadCatalog(ctx);
+      if (!catalog) stopProxy();
       await ctx.catalog.reload();
     });
 
@@ -163,7 +164,7 @@ function watchConnections(
           event.type === "integration.connection.updated" &&
           event.data.integrationID === CURSOR_ID
         ) {
-          await refresh();
+          await refresh().catch(() => {});
         }
       }
     } catch {}

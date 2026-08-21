@@ -461,10 +461,19 @@ async function testV2Plugin(
     },
   };
 
-  let markReload = () => {};
-  const reloaded = new Promise<void>((resolve) => {
-    markReload = resolve;
-  });
+  let markReload: (() => void) | undefined;
+  let failReload = false;
+  function waitForReload(): Promise<void> {
+    const pending = Promise.withResolvers<void>();
+    markReload = pending.resolve;
+    return Promise.race([
+      pending.promise,
+      Bun.sleep(500).then(() => {
+        throw new Error("Expected V2 catalog reload");
+      }),
+    ]);
+  }
+  let connected = true;
   let credential = Credential.OAuth.make({
     type: "oauth",
     methodID: Integration.MethodID.make("cursor-oauth"),
@@ -479,28 +488,38 @@ async function testV2Plugin(
     data: { integrationID: "cursor" },
   };
   let eventClosed = false;
-  let closeEvent: (() => void) | undefined;
+  const eventQueue: Array<typeof connectionEvent> = [];
+  let sendEvent:
+    | ((result: IteratorResult<typeof connectionEvent>) => void)
+    | undefined;
+  function emitUpdate(): void {
+    if (sendEvent) {
+      const send = sendEvent;
+      sendEvent = undefined;
+      send({ done: false, value: connectionEvent });
+      return;
+    }
+    eventQueue.push(connectionEvent);
+  }
   const eventStream = {
     [Symbol.asyncIterator]() {
-      let sent = false;
       return {
         next(): Promise<IteratorResult<typeof connectionEvent>> {
           if (eventClosed) {
             return Promise.resolve({ done: true, value: undefined });
           }
-          if (!sent) {
-            sent = true;
-            return Promise.resolve({ done: false, value: connectionEvent });
+          const event = eventQueue.shift();
+          if (event) {
+            return Promise.resolve({ done: false, value: event });
           }
-          const pending =
-            Promise.withResolvers<IteratorResult<typeof connectionEvent>>();
-          closeEvent = () =>
-            pending.resolve({ done: true, value: undefined });
-          return pending.promise;
+          return new Promise((resolve) => {
+            sendEvent = resolve;
+          });
         },
         return(): Promise<IteratorResult<typeof connectionEvent>> {
           eventClosed = true;
-          closeEvent?.();
+          sendEvent?.({ done: true, value: undefined });
+          sendEvent = undefined;
           return Promise.resolve({ done: true, value: undefined });
         },
       };
@@ -518,6 +537,7 @@ async function testV2Plugin(
       },
       connection: {
         async active() {
+          if (!connected) return undefined;
           return {
             type: "credential" as const,
             id: "cursor-test",
@@ -543,9 +563,15 @@ async function testV2Plugin(
         return { async dispose() {} };
       },
       async reload() {
+        modelIDs.length = 0;
         assert(catalogTransform, "Expected V2 catalog transform");
         catalogTransform(catalogDraft);
-        markReload();
+        markReload?.();
+        markReload = undefined;
+        if (failReload) {
+          failReload = false;
+          throw new Error("Injected catalog reload failure");
+        }
       },
     },
     event: {
@@ -561,7 +587,14 @@ async function testV2Plugin(
     context as unknown as V2Context,
   );
   assert(integrationTransform, "Expected V2 integration transform");
-  await reloaded;
+  failReload = true;
+  const failedReload = waitForReload();
+  emitUpdate();
+  await failedReload;
+
+  const retry = waitForReload();
+  emitUpdate();
+  await retry;
   assertArrayEqual(
     backend.getRefreshAuthHeaders(),
     ["Bearer valid-refresh"],
@@ -634,6 +667,16 @@ async function testV2Plugin(
     backend.getRefreshAuthHeaders(),
     ["Bearer valid-refresh"],
     "Expected V2 refresh token request",
+  );
+
+  connected = false;
+  const stopped = waitForReload();
+  emitUpdate();
+  await stopped;
+  assertEqual(
+    modules.getProxyPort(),
+    undefined,
+    "Expected V2 disconnect to stop the proxy",
   );
 
   assert(typeof cleanup === "function", "Expected V2 cleanup");
