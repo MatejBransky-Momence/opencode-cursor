@@ -68,6 +68,8 @@ const CursorV2Plugin = Plugin.define({
         },
       });
     });
+    // Setup batches transforms, so apply OAuth refresh before loading the catalog.
+    await ctx.integration.reload();
 
     let catalog = await loadCatalog(ctx);
     await ctx.catalog.transform((draft) => {
@@ -104,21 +106,18 @@ const CursorV2Plugin = Plugin.define({
       }
     });
 
-    const controller = new AbortController();
-    const watcher = watchConnections(
-      ctx,
-      async () => {
-        clearModelCache();
-        catalog = await loadCatalog(ctx);
-        await ctx.catalog.reload();
-      },
-      controller.signal,
-    );
+    const stopWatching = watchConnections(ctx, async () => {
+      clearModelCache();
+      catalog = await loadCatalog(ctx);
+      await ctx.catalog.reload();
+    });
 
     return async () => {
-      controller.abort();
-      await watcher;
-      stopProxy();
+      try {
+        await stopWatching();
+      } finally {
+        stopProxy();
+      }
     };
   },
 });
@@ -149,19 +148,29 @@ async function getAccessToken(ctx: Plugin.Context): Promise<string> {
   return credential.access;
 }
 
-async function watchConnections(
+function watchConnections(
   ctx: Plugin.Context,
   refresh: () => Promise<void>,
-  signal: AbortSignal,
-): Promise<void> {
-  try {
-    for await (const event of ctx.event.subscribe({ signal })) {
-      if (
-        event.type === "integration.connection.updated" &&
-        event.data.integrationID === CURSOR_ID
-      ) {
-        await refresh();
+): () => Promise<void> {
+  const events = ctx.event.subscribe()[Symbol.asyncIterator]();
+  const watcher = (async () => {
+    try {
+      while (true) {
+        const next = await events.next();
+        if (next.done) return;
+        const event = next.value;
+        if (
+          event.type === "integration.connection.updated" &&
+          event.data.integrationID === CURSOR_ID
+        ) {
+          await refresh();
+        }
       }
-    }
-  } catch {}
+    } catch {}
+  })();
+
+  return async () => {
+    await events.return?.();
+    await watcher;
+  };
 }

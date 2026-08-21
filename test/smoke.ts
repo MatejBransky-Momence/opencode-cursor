@@ -139,7 +139,10 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         discoveryAuthHeaders.push(authHeader);
         discoveryRequestBodies.push(new Uint8Array(Buffer.concat(chunks)));
 
-        if (discoveryMode === "auth-error") {
+        if (
+          discoveryMode === "auth-error" ||
+          authHeader === "Bearer expired-access"
+        ) {
           stream.respond({
             ":status": 401,
             "content-type": "application/json",
@@ -462,12 +465,56 @@ async function testV2Plugin(
   const reloaded = new Promise<void>((resolve) => {
     markReload = resolve;
   });
-  const access = makeJwt(Math.floor(Date.now() / 1000) + 3600);
+  let credential = Credential.OAuth.make({
+    type: "oauth",
+    methodID: Integration.MethodID.make("cursor-oauth"),
+    refresh: "valid-refresh",
+    access: "expired-access",
+    expires: Date.now() - 1,
+  });
+  const connectionEvent = {
+    id: "cursor-connection-updated",
+    created: Date.now(),
+    type: "integration.connection.updated" as const,
+    data: { integrationID: "cursor" },
+  };
+  let eventClosed = false;
+  let closeEvent: (() => void) | undefined;
+  const eventStream = {
+    [Symbol.asyncIterator]() {
+      let sent = false;
+      return {
+        next(): Promise<IteratorResult<typeof connectionEvent>> {
+          if (eventClosed) {
+            return Promise.resolve({ done: true, value: undefined });
+          }
+          if (!sent) {
+            sent = true;
+            return Promise.resolve({ done: false, value: connectionEvent });
+          }
+          const pending =
+            Promise.withResolvers<IteratorResult<typeof connectionEvent>>();
+          closeEvent = () =>
+            pending.resolve({ done: true, value: undefined });
+          return pending.promise;
+        },
+        return(): Promise<IteratorResult<typeof connectionEvent>> {
+          eventClosed = true;
+          closeEvent?.();
+          return Promise.resolve({ done: true, value: undefined });
+        },
+      };
+    },
+  };
   const context = {
     integration: {
       async transform(transform: IntegrationTransform) {
         integrationTransform = transform;
         return { async dispose() {} };
+      },
+      async reload() {
+        assert(integrationTransform, "Expected V2 integration transform");
+        integrationTransform(integrationDraft);
       },
       connection: {
         async active() {
@@ -478,13 +525,15 @@ async function testV2Plugin(
           };
         },
         async resolve() {
-          return Credential.OAuth.make({
-            type: "oauth",
-            methodID: Integration.MethodID.make("cursor-oauth"),
-            refresh: "valid-refresh",
-            access,
-            expires: Date.now() + 3_600_000,
-          });
+          if (
+            credential.expires <= Date.now() + 5 * 60 * 1000 &&
+            authMethod &&
+            "refresh" in authMethod &&
+            authMethod.refresh
+          ) {
+            credential = await authMethod.refresh(credential);
+          }
+          return credential;
         },
       },
     },
@@ -500,13 +549,8 @@ async function testV2Plugin(
       },
     },
     event: {
-      async *subscribe() {
-        yield {
-          id: "cursor-connection-updated",
-          created: Date.now(),
-          type: "integration.connection.updated" as const,
-          data: { integrationID: "cursor" },
-        };
+      subscribe() {
+        return eventStream;
       },
     },
   };
@@ -517,8 +561,18 @@ async function testV2Plugin(
     context as unknown as V2Context,
   );
   assert(integrationTransform, "Expected V2 integration transform");
-  integrationTransform(integrationDraft);
   await reloaded;
+  assertArrayEqual(
+    backend.getRefreshAuthHeaders(),
+    ["Bearer valid-refresh"],
+    "Expected V2 startup to refresh an expired credential",
+  );
+  const discoveryHeaders = backend.getDiscoveryAuthHeaders();
+  assert(
+    discoveryHeaders.length > 0 &&
+      discoveryHeaders.every((header) => header !== "Bearer expired-access"),
+    `Expected V2 discovery to use refreshed auth, got ${JSON.stringify(discoveryHeaders)}`,
+  );
 
   assertEqual(
     modules.CursorV2Plugin.id,
@@ -583,7 +637,12 @@ async function testV2Plugin(
   );
 
   assert(typeof cleanup === "function", "Expected V2 cleanup");
-  await cleanup();
+  const cleanedUp = await Promise.race([
+    cleanup().then(() => true),
+    Bun.sleep(500).then(() => false),
+  ]);
+  assert(cleanedUp, "Expected V2 cleanup to finish");
+  assert(eventClosed, "Expected V2 cleanup to close the event stream");
   assertEqual(
     modules.getProxyPort(),
     undefined,
