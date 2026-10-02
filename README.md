@@ -3,32 +3,19 @@
 OpenCode plugin that connects to Cursor's API, giving you access to Cursor
 models inside OpenCode with full tool-calling support.
 
-## OpenCode V2 beta
+## OpenCode V2
 
-Install the plugin:
-
-```sh
-opencode2 plugin add opencode-cursor-oauth
-```
-
-The command adds the package to your global V2 configuration.
-
-Start `opencode2`.
-Run `/connect`.
-Select Cursor.
-
-The plugin adds Cursor OAuth and the available models to the V2 catalog.
-
-You can also add the package directly to `opencode.jsonc`:
+Add the package to your global or project `opencode.jsonc` configuration:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    "opencode-cursor-oauth"
-  ]
+  "plugins": ["opencode-cursor-oauth"],
 }
 ```
+
+Start OpenCode, run `/connect`, and select Cursor. The plugin registers Cursor
+OAuth and publishes the available models through OpenCode's provider API.
 
 ## OpenCode V1
 
